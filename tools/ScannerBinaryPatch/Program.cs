@@ -123,6 +123,9 @@ try
         foreach (Instruction i in tail)
             instructions.Insert(pos++, i);
 
+        // Inserted IL changes relative branch offsets; normalize all short branches before writing.
+        moveNext.Body.SimplifyBranches();
+        moveNext.Body.OptimizeBranches();
         Console.WriteLine("Patched exactly one method: " + iterator.FullName + ".MoveNext");
         module.Write(tempPath);
     }
