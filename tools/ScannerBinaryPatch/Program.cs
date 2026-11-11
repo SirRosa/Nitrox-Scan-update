@@ -69,8 +69,8 @@ try
         // IEnumerator[] returns an IEnumerator; Unity executes yielded nested
         // IEnumerators sequentially. This avoids rewriting the iterator's own
         // state dispatch and preserves the full original RestoreMapRoom behavior.
-        TypeRef iterable = new(module, "System.Collections", "IEnumerable", module.CorLibTypes.AssemblyRef);
-        TypeRef enumerator = new(module, "System.Collections", "IEnumerator", module.CorLibTypes.AssemblyRef);
+        TypeRef iterable = new TypeRefUser(module, "System.Collections", "IEnumerable", module.CorLibTypes.AssemblyRef);
+        TypeRef enumerator = new TypeRefUser(module, "System.Collections", "IEnumerator", module.CorLibTypes.AssemblyRef);
         IMethod getEnumerator = new MemberRefUser(module, "GetEnumerator",
             MethodSig.CreateInstance(new ClassSig(enumerator)), iterable);
 
