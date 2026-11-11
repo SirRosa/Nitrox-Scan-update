@@ -1,173 +1,156 @@
-using Mono.Cecil;
-using Mono.Cecil.Cil;
+using dnlib.DotNet;
+using dnlib.DotNet.Emit;
 using System.Collections;
 using System.Security.Cryptography;
 
 if (args.Length != 1 || !File.Exists(args[0]))
 {
-    Console.Error.WriteLine("Usage: ScannerBinaryPatch <path-to-official-NitroxClient.dll>");
+    Console.Error.WriteLine("Usage: ScannerBinaryPatch <NitroxClient.dll from official 1.8.1.0>");
     return 2;
 }
 
 string path = Path.GetFullPath(args[0]);
-string originalSha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
-Console.WriteLine($"Original NitroxClient.dll SHA256: {originalSha}");
-
+string originalHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+Console.WriteLine("Original NitroxClient.dll SHA256: " + originalHash);
 string tempPath = path + ".scannerpatch.tmp";
 try
 {
-    using (AssemblyDefinition assembly = AssemblyDefinition.ReadAssembly(path, new ReaderParameters { InMemory = true }))
+    using (ModuleDefMD module = ModuleDefMD.Load(path))
     {
-        ModuleDefinition module = assembly.MainModule;
-        if (assembly.Name.Name != "NitroxClient" || assembly.Name.Version.ToString() != "1.8.1.0")
-        {
-            throw new InvalidOperationException($"Not an official-version NitroxClient 1.8.1.0 assembly: {assembly.Name}");
-        }
+        if (module.Assembly?.Name.String != "NitroxClient" ||
+            module.Assembly.Version.ToString() != "1.8.1.0")
+            throw new InvalidOperationException("Unexpected Nitrox assembly/version — refusing to patch: " + module.Assembly);
 
-        // Locate the exact 1.8.1.0 compiler-generated coroutine. The original
-        // RestoreMapRoom coroutine is NOT replaced: it must complete first.
-        TypeDefinition buildType = module.GetTypes().Single(t =>
-            t.Name == "BuildEntitySpawner" && t.Namespace == "NitroxClient.GameLogic.Spawning.Bases");
-        TypeDefinition stateMachine = buildType.NestedTypes.Single(t =>
-            t.Name.StartsWith("<SpawnAsync>d__", StringComparison.Ordinal));
-        MethodDefinition moveNext = stateMachine.Methods.Single(m => m.Name == "MoveNext");
-        MethodDefinition? unrelated = null; // Deliberately retain a single target method.
-        _ = unrelated;
-        Instruction restoreCall = moveNext.Body.Instructions.Single(i =>
+        // Find exactly the one IEnumerator state machine from the original 1.8.1.0.
+        TypeDef owner = module.GetTypes().Single(t =>
+            t.Name.String == "BuildEntitySpawner" &&
+            t.Namespace.String == "NitroxClient.GameLogic.Spawning.Bases");
+        TypeDef iterator = owner.NestedTypes.Single(t =>
+            t.Name.String.StartsWith("<SpawnAsync>d__", StringComparison.Ordinal));
+        MethodDef moveNext = iterator.Methods.Single(m => m.Name.String == "MoveNext");
+        var instructions = moveNext.Body!.Instructions;
+
+        Instruction restoreCall = instructions.Single(i =>
             (i.OpCode == OpCodes.Call || i.OpCode == OpCodes.Callvirt) &&
-            i.Operand is MethodReference m &&
-            m.Name == "RestoreMapRoom" && m.DeclaringType.Name == "InteriorPieceEntitySpawner");
-        MethodReference restoreMethod = (MethodReference)restoreCall.Operand;
+            i.Operand is IMethod m && m.Name.String == "RestoreMapRoom" &&
+            m.DeclaringType?.Name.String == "InteriorPieceEntitySpawner");
+        IMethod restore = (IMethod)restoreCall.Operand!;
+        if (restore.MethodSig is null || restore.MethodSig.Params.Count != 2 ||
+            restore.MethodSig.RetType.FullName != "System.Collections.IEnumerator")
+            throw new InvalidOperationException("Unexpected RestoreMapRoom signature");
 
-        if (restoreMethod.Parameters.Count != 2 || restoreMethod.ReturnType.FullName != typeof(IEnumerator).FullName)
-        {
-            throw new InvalidOperationException("RestoreMapRoom signature has changed; refusing to patch.");
-        }
+        FieldDef parent = iterator.Fields.Single(f => f.Name.String == "<>4__this");
+        FieldDef entities = owner.Fields.Single(f => f.Name.String == "entities");
+        Local room = new(restore.MethodSig.Params[1]);
 
-        FieldDefinition thisField = stateMachine.Fields.Single(f => f.Name == "<>4__this");
-        FieldDefinition entitiesField = buildType.Fields.Single(f => f.Name == "entities");
-        TypeReference mapRoomType = restoreMethod.Parameters[1].ParameterType;
-
-        // Reuse the ORIGINAL assembly's existing framework and Nitrox method
-        // references. Do not introduce .NET 9 references into a .NET 4.7.2 DLL.
-        List<MethodReference> calls = module.GetTypes()
+        // Reuse pre-existing Nitrox and BCL method references; never import
+        // .NET 9 signatures into this game-targeting .NET Framework 4.7.2 DLL.
+        var calls = module.GetTypes()
             .SelectMany(t => t.Methods.Where(m => m.HasBody))
-            .SelectMany(m => m.Body.Instructions)
+            .SelectMany(m => m.Body!.Instructions)
             .Select(i => i.Operand)
-            .OfType<MethodReference>()
+            .OfType<IMethod>()
             .ToList();
+        IMethod children = calls.First(m =>
+            m.Name.String == "get_ChildEntities" &&
+            m.DeclaringType?.Name.String == "Entity");
+        IMethod inventoryOnly = calls.OfType<MethodSpec>().First(m =>
+            m.Name.String == "OfType" && m.DeclaringType?.FullName == "System.Linq.Enumerable" &&
+            m.GenericInstMethodSig?.GenericArguments.Count == 1 &&
+            m.GenericInstMethodSig.GenericArguments[0].FullName.EndsWith(".InventoryItemEntity", StringComparison.Ordinal));
+        IMethod toList = calls.OfType<MethodSpec>().First(m =>
+            m.Name.String == "ToList" && m.DeclaringType?.FullName == "System.Linq.Enumerable" &&
+            m.GenericInstMethodSig?.GenericArguments.Count == 1 &&
+            m.GenericInstMethodSig.GenericArguments[0].FullName.EndsWith(".Entity", StringComparison.Ordinal));
+        IMethod spawn = calls.First(m =>
+            m.Name.String == "SpawnBatchAsync" && m.DeclaringType?.Name.String == "Entities" &&
+            m.MethodSig?.Params.Count == 3);
 
-        MethodReference childEntitiesGetter = calls.First(m =>
-            m.Name == "get_ChildEntities" && m.DeclaringType.Name == "Entity");
-        MethodReference ofType = calls.OfType<GenericInstanceMethod>().First(m =>
-            m.Name == "OfType" && m.DeclaringType.FullName == "System.Linq.Enumerable" &&
-            m.GenericArguments.Count == 1 && m.GenericArguments[0].Name == "InventoryItemEntity");
-        MethodReference toList = calls.OfType<GenericInstanceMethod>().First(m =>
-            m.Name == "ToList" && m.DeclaringType.FullName == "System.Linq.Enumerable" &&
-            m.GenericArguments.Count == 1 && m.GenericArguments[0].Name == "Entity");
-        MethodReference spawnBatch = calls.First(m =>
-            m.Name == "SpawnBatchAsync" && m.DeclaringType.Name == "Entities" &&
-            m.Parameters.Count == 3 && m.ReturnType.FullName == typeof(IEnumerator).FullName);
+        // IEnumerator[] returns an IEnumerator; Unity executes yielded nested
+        // IEnumerators sequentially. This avoids rewriting the iterator's own
+        // state dispatch and preserves the full original RestoreMapRoom behavior.
+        TypeRef iterable = new(module, "System.Collections", "IEnumerable", module.CorLibTypes.AssemblyRef);
+        TypeRef enumerator = new(module, "System.Collections", "IEnumerator", module.CorLibTypes.AssemblyRef);
+        IMethod getEnumerator = new MemberRefUser(module, "GetEnumerator",
+            MethodSig.CreateInstance(new ClassSig(enumerator)), iterable);
 
-        // Unity runs yielded IEnumerator values recursively. Instead of editing
-        // the coroutine state machine or needing Subnautica's proprietary DLLs,
-        // replace the single yielded RestoreMapRoom IEnumerator with an
-        // IEnumerator over [originalRestore, deferredChipSpawn].
-        // Only MoveNext is modified; every other method remains untouched.
-        TypeReference iteratorType = new("System.Collections", "IEnumerator", module, module.TypeSystem.CoreLibrary);
-        TypeReference enumerableType = new("System.Collections", "IEnumerable", module, module.TypeSystem.CoreLibrary);
-        MethodReference getEnumerator = new("GetEnumerator", iteratorType, enumerableType) { HasThis = true };
-
+        Local restoreCoroutine = new(new ClassSig(enumerator));
+        moveNext.Body.Variables.Add(room);
+        moveNext.Body.Variables.Add(restoreCoroutine);
         moveNext.Body.InitLocals = true;
-        VariableDefinition mapRoomLocal = new(mapRoomType);
-        VariableDefinition restoreEnumeratorLocal = new(iteratorType);
-        moveNext.Body.Variables.Add(mapRoomLocal);
-        moveNext.Body.Variables.Add(restoreEnumeratorLocal);
 
-        ILProcessor il = moveNext.Body.GetILProcessor();
-
-        // On entry to RestoreMapRoom(Base, MapRoomEntity), the MapRoomEntity
-        // argument is at the top of the evaluation stack. Preserve one copy.
-        il.InsertBefore(restoreCall, il.Create(OpCodes.Dup));
-        il.InsertBefore(restoreCall, il.Create(OpCodes.Stloc, mapRoomLocal));
+        // On call RestoreMapRoom(Base, MapRoomEntity), the room parameter is
+        // top of stack. Capture it without changing either original argument.
+        int pos = instructions.IndexOf(restoreCall);
+        instructions.Insert(pos++, Instruction.Create(OpCodes.Dup));
+        instructions.Insert(pos++, Instruction.Create(OpCodes.Stloc, room));
 
         Instruction[] tail =
         [
-            il.Create(OpCodes.Stloc, restoreEnumeratorLocal),
-            il.Create(OpCodes.Ldc_I4_2),
-            il.Create(OpCodes.Newarr, iteratorType),
+            Instruction.Create(OpCodes.Stloc, restoreCoroutine),
+            Instruction.Create(OpCodes.Ldc_I4_2),
+            Instruction.Create(OpCodes.Newarr, enumerator),
 
-            // array[0] = original RestoreMapRoom coroutine
-            il.Create(OpCodes.Dup),
-            il.Create(OpCodes.Ldc_I4_0),
-            il.Create(OpCodes.Ldloc, restoreEnumeratorLocal),
-            il.Create(OpCodes.Stelem_Ref),
+            // enumerators[0] = original RestoreMapRoom iterator
+            Instruction.Create(OpCodes.Dup),
+            Instruction.Create(OpCodes.Ldc_I4_0),
+            Instruction.Create(OpCodes.Ldloc, restoreCoroutine),
+            Instruction.Create(OpCodes.Stelem_Ref),
 
-            // array[1] = Entities.SpawnBatchAsync(
-            //    mapRoomEntity.ChildEntities.OfType<InventoryItemEntity>()
-            //        .ToList<Entity>(), forceRespawn: true, skipFrames: true)
-            il.Create(OpCodes.Dup),
-            il.Create(OpCodes.Ldc_I4_1),
-            il.Create(OpCodes.Ldarg_0),
-            il.Create(OpCodes.Ldfld, thisField),
-            il.Create(OpCodes.Ldfld, entitiesField),
-            il.Create(OpCodes.Ldloc, mapRoomLocal),
-            il.Create(OpCodes.Callvirt, childEntitiesGetter),
-            il.Create(OpCodes.Call, ofType),
-            il.Create(OpCodes.Call, toList),
-            il.Create(OpCodes.Ldc_I4_1),
-            il.Create(OpCodes.Ldc_I4_1),
-            il.Create(OpCodes.Callvirt, spawnBatch),
-            il.Create(OpCodes.Stelem_Ref),
+            // enumerators[1] = entities.SpawnBatchAsync(room.ChildEntities
+            //              .OfType<InventoryItemEntity>().ToList<Entity>(),
+            //               forceRespawn:true, skipFrames:true)
+            Instruction.Create(OpCodes.Dup),
+            Instruction.Create(OpCodes.Ldc_I4_1),
+            Instruction.Create(OpCodes.Ldarg_0),
+            Instruction.Create(OpCodes.Ldfld, parent),
+            Instruction.Create(OpCodes.Ldfld, entities),
+            Instruction.Create(OpCodes.Ldloc, room),
+            Instruction.Create(OpCodes.Callvirt, children),
+            Instruction.Create(OpCodes.Call, inventoryOnly),
+            Instruction.Create(OpCodes.Call, toList),
+            Instruction.Create(OpCodes.Ldc_I4_1),
+            Instruction.Create(OpCodes.Ldc_I4_1),
+            Instruction.Create(OpCodes.Callvirt, spawn),
+            Instruction.Create(OpCodes.Stelem_Ref),
 
-            // return IEnumerator that yields the two child coroutines in order
-            il.Create(OpCodes.Castclass, enumerableType),
-            il.Create(OpCodes.Callvirt, getEnumerator)
+            // Enumerator over both nested coroutine steps.
+            Instruction.Create(OpCodes.Castclass, iterable),
+            Instruction.Create(OpCodes.Callvirt, getEnumerator)
         ];
-        Instruction last = restoreCall;
-        foreach (Instruction instruction in tail)
-        {
-            il.InsertAfter(last, instruction);
-            last = instruction;
-        }
 
-        Console.WriteLine($"Patched: {buildType.FullName}/{stateMachine.Name}.MoveNext");
-        Console.WriteLine("Added: original RestoreMapRoom coroutine, then forced respawn of Scanner Room InventoryItemEntity children.");
+        pos = instructions.IndexOf(restoreCall) + 1;
+        foreach (Instruction i in tail)
+            instructions.Insert(pos++, i);
 
-        assembly.Write(tempPath);
+        Console.WriteLine("Patched exactly one method: " + iterator.FullName + ".MoveNext");
+        module.Write(tempPath);
     }
 
-    // Round-trip structural validation: exactly one new GetEnumerator
-    // invocation in the targeted MoveNext body and a valid patched assembly.
-    using (AssemblyDefinition validated = AssemblyDefinition.ReadAssembly(tempPath))
+    using (ModuleDefMD check = ModuleDefMD.Load(tempPath))
     {
-        TypeDefinition owner = validated.MainModule.GetTypes().Single(t =>
-            t.Name == "BuildEntitySpawner" && t.Namespace == "NitroxClient.GameLogic.Spawning.Bases");
-        MethodDefinition moveNext = owner.NestedTypes.Single(t => t.Name.StartsWith("<SpawnAsync>d__", StringComparison.Ordinal))
-            .Methods.Single(m => m.Name == "MoveNext");
-        int wrapperCount = moveNext.Body.Instructions.Count(i =>
-            i.OpCode == OpCodes.Callvirt && i.Operand is MethodReference m &&
-            m.Name == "GetEnumerator" && m.DeclaringType.FullName == "System.Collections.IEnumerable");
-        if (wrapperCount != 1)
-        {
-            throw new InvalidOperationException($"Patch verification failed; found {wrapperCount} wrapper calls.");
-        }
+        var iterator = check.GetTypes().Single(t =>
+            t.Name.String.StartsWith("<SpawnAsync>d__", StringComparison.Ordinal) &&
+            t.DeclaringType?.Name.String == "BuildEntitySpawner");
+        var method = iterator.Methods.Single(m => m.Name.String == "MoveNext");
+        int count = method.Body!.Instructions.Count(i =>
+            i.OpCode == OpCodes.Callvirt && i.Operand is IMethod m &&
+            m.Name.String == "GetEnumerator" && m.DeclaringType?.FullName == "System.Collections.IEnumerable");
+        if (count != 1)
+            throw new InvalidOperationException($"Patch verification failed; wrapper count={count}");
     }
-
     File.Copy(tempPath, path, overwrite: true);
-    Console.WriteLine($"Patched NitroxClient.dll SHA256: {Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)))}");
+    Console.WriteLine("Patched NitroxClient.dll SHA256: " +
+        Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))));
     return 0;
 }
-catch (Exception ex)
+catch (Exception e)
 {
-    Console.Error.WriteLine("Patch FAILED — did not overwrite original DLL:");
-    Console.Error.WriteLine(ex);
+    Console.Error.WriteLine("Patch failed; original DLL preserved: " + e);
     return 1;
 }
 finally
 {
     if (File.Exists(tempPath))
-    {
         File.Delete(tempPath);
-    }
 }
