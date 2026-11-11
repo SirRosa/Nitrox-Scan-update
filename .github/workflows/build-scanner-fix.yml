@@ -1,0 +1,103 @@
+name: Build Nitrox 1.8.1 scanner fix (Windows)
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/**'
+      - '.github/workflows/build-scanner-fix.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out patching tools
+        uses: actions/checkout@v4
+
+      - name: Install .NET 9 SDK (patch tool only)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Download and verify official Nitrox 1.8.1.0 win-x64
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $zip = Join-Path $env:RUNNER_TEMP 'Nitrox_1.8.1.0_win_x64.zip'
+          $target = Join-Path $env:RUNNER_TEMP 'NitroxScannerTest'
+          $url = 'https://github.com/SubnauticaNitrox/Nitrox/releases/download/1.8.1.0/Nitrox_1.8.1.0_win_x64.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zip -MaximumRetryCount 3
+          $actual = (Get-FileHash -Path $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expected = '1b9cd0f1e9f0ed9a072d18a1a548ea3b307b5f94b25559e0a58bff3c8a986adc'
+          if ($actual -ne $expected) { throw "Official Nitrox archive hash mismatch. Expected $expected, got $actual" }
+          Expand-Archive -Path $zip -DestinationPath $target -Force
+          $dlls = @(Get-ChildItem -Path $target -Recurse -File -Filter 'NitroxClient.dll')
+          if ($dlls.Count -ne 1) { throw "Expected one NitroxClient.dll, found $($dlls.Count)" }
+          $dlls[0].FullName | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'scanner-dll-path.txt')
+          $files = @{}
+          Get-ChildItem -Path $target -Recurse -File | ForEach-Object {
+            $relative = [System.IO.Path]::GetRelativePath($target, $_.FullName)
+            $files[$relative] = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash
+          }
+          $files | ConvertTo-Json | Set-Content -Path (Join-Path $env:RUNNER_TEMP 'baseline-hashes.json')
+          Write-Host "Official release hash verified, original files: $($files.Count)"
+          Write-Host "Client DLL: $($dlls[0].FullName)"
+
+      - name: Patch only NitroxClient.dll and validate its IL
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dll = (Get-Content (Join-Path $env:RUNNER_TEMP 'scanner-dll-path.txt') -Raw).Trim()
+          dotnet run --project tools/ScannerBinaryPatch/ScannerBinaryPatch.csproj -c Release -- "$dll"
+          if ($LASTEXITCODE -ne 0) { throw "Scanner patcher failed with exit code $LASTEXITCODE" }
+
+      - name: Ensure all other release files are byte-for-byte unchanged
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $target = Join-Path $env:RUNNER_TEMP 'NitroxScannerTest'
+          $baseline = Get-Content (Join-Path $env:RUNNER_TEMP 'baseline-hashes.json') -Raw | ConvertFrom-Json -AsHashtable
+          $files = @(Get-ChildItem -Path $target -Recurse -File)
+          if ($files.Count -ne $baseline.Count) { throw 'Release file count changed' }
+          $changed = @()
+          foreach ($file in $files) {
+            $relative = [System.IO.Path]::GetRelativePath($target, $file.FullName)
+            $hash = (Get-FileHash $file.FullName -Algorithm SHA256).Hash
+            if ($hash -ne $baseline[$relative]) { $changed += $relative }
+          }
+          if ($changed.Count -ne 1 -or [System.IO.Path]::GetFileName($changed[0]) -ne 'NitroxClient.dll') {
+            throw "Expected only NitroxClient.dll to change, got: $($changed -join ', ')"
+          }
+          Write-Host "VERIFIED: Only $($changed[0]) changed. All other release files are identical."
+          @'
+          NITROX 1.8.1.0 — SCANNER ROOM CHIP FIX (TEST)
+          
+          To jest pelna paczka Nitroxa na Windows x64 z jedna zmiana:
+          biblioteka NitroxClient.dll odtwarza zapisane moduly pomieszczenia skanera.
+          Bez zmian: launcher, serwer, pozostale biblioteki i zasoby.
+          
+          INSTALACJA:
+          1. Wykonaj kopie zapasowa zapisu serwera i oryginalnego katalogu Nitroxa.
+          2. Rozpakuj cala paczke do NOWEGO katalogu, nie nadpisuj oryginalnej wersji.
+          3. Uruchom launcher z nowego katalogu.
+          4. Testuj na kopii swiata; sprawdz wylogowanie i ponowne polaczenie,
+             a takze restart serwera z zamontowanymi modulami skanera.
+          
+          To eksperymentalna poprawka tylko skanera; nie naprawia modulow pojazdow.
+          Zrodlo: https://github.com/SirRosa/Nitrox-Scan-update
+          Oryginal: https://github.com/SubnauticaNitrox/Nitrox/releases/tag/1.8.1.0
+          '@ | Set-Content -Path (Join-Path $target 'SCANNER_FIX_README_PL.txt') -Encoding UTF8
+
+      - name: Upload complete Windows test package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nitrox-1.8.1.0-ScannerRoomFix-Windows-x64
+          path: ${{ runner.temp }}/NitroxScannerTest/
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 30
