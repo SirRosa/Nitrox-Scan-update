@@ -9,7 +9,7 @@ This is an **experimental** patch. It addresses Scanner Room upgrades only, not 
 
 ## Build
 See [Actions → Build Nitrox scanner fix](../../actions/workflows/build-scanner-fix.yml).
-The workflow downloads the **official** `Nitrox_1.8.1.0_win_x64.zip`, verifies its SHA-256, modifies only the target assembly using Mono.Cecil, validates the result, then uploads a Windows test package. No Subnautica game binaries are downloaded or redistributed.
+The workflow downloads the **official** `Nitrox_1.8.1.0_win_x64.zip`, verifies its SHA-256, modifies only the target assembly using dnlib, validates the result, then uploads a Windows test package. No Subnautica game binaries are downloaded or redistributed.
 
 ## Installation
 1. Back up your Nitrox server save **and** your existing Nitrox launcher directory.
